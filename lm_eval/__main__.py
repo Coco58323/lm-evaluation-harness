@@ -149,6 +149,12 @@ def parse_eval_args() -> argparse.Namespace:
         default=False,
         help="Use with --log_samples. Only model outputs will be saved and metrics will not be evaluated.",
     )
+    parser.add_argument(
+        "--samples",
+        "-S",
+        action="store_true",
+        default=False,
+    )
     return parser.parse_args()
 
 
@@ -237,61 +243,118 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
 
     eval_logger.info(f"Selected Tasks: {task_names}")
     eval_logger.info("Loading selected tasks...")
-
-    results = evaluator.simple_evaluate(
-        model=args.model,
-        model_args=args.model_args,
-        tasks=task_names,
-        num_fewshot=args.num_fewshot,
-        batch_size=args.batch_size,
-        max_batch_size=args.max_batch_size,
-        device=args.device,
-        use_cache=args.use_cache,
-        limit=args.limit,
-        decontamination_ngrams_path=args.decontamination_ngrams_path,
-        check_integrity=args.check_integrity,
-        write_out=args.write_out,
-        log_samples=args.log_samples,
-        gen_kwargs=args.gen_kwargs,
-        task_manager=task_manager,
-        predict_only=args.predict_only,
-    )
-
-    if results is not None:
-        if args.log_samples:
-            samples = results.pop("samples")
-        dumped = json.dumps(
-            results, indent=2, default=_handle_non_serializable, ensure_ascii=False
+    if not args.samples:
+        results = evaluator.simple_evaluate(
+            model=args.model,
+            model_args=args.model_args,
+            tasks=task_names,
+            num_fewshot=args.num_fewshot,
+            batch_size=args.batch_size,
+            max_batch_size=args.max_batch_size,
+            device=args.device,
+            use_cache=args.use_cache,
+            limit=args.limit,
+            decontamination_ngrams_path=args.decontamination_ngrams_path,
+            check_integrity=args.check_integrity,
+            write_out=args.write_out,
+            log_samples=args.log_samples,
+            gen_kwargs=args.gen_kwargs,
+            task_manager=task_manager,
+            predict_only=args.predict_only,
         )
-        if args.show_config:
-            print(dumped)
 
-        batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
-
-        if args.output_path:
-            output_path_file.open("w", encoding="utf-8").write(dumped)
-
+        if results is not None:
             if args.log_samples:
-                for task_name, config in results["configs"].items():
-                    output_name = "{}_{}".format(
-                        re.sub("/|=", "__", args.model_args), task_name
-                    )
-                    filename = path.joinpath(f"{output_name}.jsonl")
-                    samples_dumped = json.dumps(
-                        samples[task_name],
-                        indent=2,
-                        default=_handle_non_serializable,
-                        ensure_ascii=False,
-                    )
-                    filename.write_text(samples_dumped, encoding="utf-8")
+                samples = results.pop("samples")
+            dumped = json.dumps(
+                results, indent=2, default=_handle_non_serializable, ensure_ascii=False
+            )
+            if args.show_config:
+                print(dumped)
 
-        print(
-            f"{args.model} ({args.model_args}), gen_kwargs: ({args.gen_kwargs}), limit: {args.limit}, num_fewshot: {args.num_fewshot}, "
-            f"batch_size: {args.batch_size}{f' ({batch_sizes})' if batch_sizes else ''}"
+            batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
+
+            if args.output_path:
+                output_path_file.open("w", encoding="utf-8").write(dumped)
+
+                if args.log_samples:
+                    for task_name, config in results["configs"].items():
+                        output_name = "{}_{}".format(
+                            re.sub("/|=", "__", args.model_args), task_name
+                        )
+                        filename = path.joinpath(f"{output_name}.jsonl")
+                        samples_dumped = json.dumps(
+                            samples[task_name],
+                            indent=2,
+                            default=_handle_non_serializable,
+                            ensure_ascii=False,
+                        )
+                        filename.write_text(samples_dumped, encoding="utf-8")
+
+            print(
+                f"{args.model} ({args.model_args}), gen_kwargs: ({args.gen_kwargs}), limit: {args.limit}, num_fewshot: {args.num_fewshot}, "
+                f"batch_size: {args.batch_size}{f' ({batch_sizes})' if batch_sizes else ''}"
+            )
+            print(make_table(results))
+            if "groups" in results:
+                print(make_table(results, "groups"))
+    else:
+        results_tor = evaluator.evaluate_samples(
+            model=args.model,
+            model_args=args.model_args,
+            tasks=task_names,
+            num_fewshot=args.num_fewshot,
+            batch_size=args.batch_size,
+            max_batch_size=args.max_batch_size,
+            device=args.device,
+            use_cache=args.use_cache,
+            limit=args.limit,
+            decontamination_ngrams_path=args.decontamination_ngrams_path,
+            check_integrity=args.check_integrity,
+            write_out=args.write_out,
+            log_samples=args.log_samples,
+            gen_kwargs=args.gen_kwargs,
+            task_manager=task_manager,
+            predict_only=args.predict_only,
         )
-        print(make_table(results))
-        if "groups" in results:
-            print(make_table(results, "groups"))
+        for k,results in results_tor.items():
+            if results is not None:
+                if args.log_samples:
+                    samples = results.pop("samples")
+                dumped = json.dumps(
+                    results, indent=2, default=_handle_non_serializable, ensure_ascii=False
+                )
+                if args.show_config:
+                    print(dumped)
+
+                batch_sizes = ",".join(map(str, results["config"]["batch_sizes"]))
+
+                if args.output_path:
+                    output_path_file.open("a", encoding="utf-8").write(dumped)
+
+                    if args.log_samples:
+                        for task_name, config in results["configs"].items():
+                            output_name = "{}_{}".format(
+                                re.sub("/|=", "__", args.model_args), task_name
+                            )
+                            filename = path.joinpath(f"{output_name}.jsonl")
+                            samples_dumped = json.dumps(
+                                samples[task_name],
+                                indent=2,
+                                default=_handle_non_serializable,
+                                ensure_ascii=False,
+                            )
+                            # write k into file
+                            filename.write_text(k, encoding="utf-8")
+                            filename.write_text(samples_dumped, encoding="utf-8")
+
+                print(
+                    f"{args.model} ({args.model_args}), gen_kwargs: ({args.gen_kwargs}), limit: {args.limit}, num_fewshot: {args.num_fewshot}, "
+                    f"batch_size: {args.batch_size}{f' ({batch_sizes})' if batch_sizes else ''}"
+                )
+                print(make_table(results))
+                if "groups" in results:
+                    print(make_table(results, "groups"))
 
 
 if __name__ == "__main__":

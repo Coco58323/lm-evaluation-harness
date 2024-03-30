@@ -665,3 +665,208 @@ def evaluate(
 
     else:
         return None
+
+@positional_deprecated
+def evaluate_samples(
+    model,
+    model_args=None,
+    tasks=None,
+    num_fewshot=None,
+    batch_size=None,
+    max_batch_size=None,
+    device=None,
+    use_cache=None,
+    limit=None,
+    bootstrap_iters: int = 100000,
+    check_integrity: bool = False,
+    decontamination_ngrams_path=None,
+    write_out: bool = False,
+    log_samples: bool = True,
+    gen_kwargs: str = None,
+    task_manager: TaskManager = None,
+    verbosity: str = "INFO",
+    predict_only: bool = False,
+):
+    """Instantiate and evaluate a model on a list of tasks.
+
+    :param model: Union[str, LM]
+        Name of model or LM object, see lm_eval.models.get_model
+    :param model_args: Optional[str]
+        String arguments for each model class, see LM.create_from_arg_string.
+        Ignored if `model` argument is a LM object.
+    :param tasks: list[Union[str, dict, Task]]
+        List of task names or Task objects. Task objects will be taken to have name task.EVAL_HARNESS_NAME if defined and type(task).__name__ otherwise.
+    :param num_fewshot: int
+        Number of examples in few-shot context
+    :param batch_size: int or str, optional
+        Batch size for model
+    :param max_batch_size: int, optional
+        Maximal batch size to try with automatic batch size detection
+    :param device: str, optional
+        PyTorch device (e.g. "cpu" or "cuda:0") for running models
+    :param use_cache: str, optional
+        A path to a sqlite db file for caching model responses. `None` if not caching.
+    :param limit: int or float, optional
+        Limit the number of examples per task (only use this for testing), If <1, limit is a percentage of the total number of examples.
+    :param bootstrap_iters:
+        Number of iterations for bootstrap statistics
+    :param check_integrity: bool
+        Whether to run the relevant part of the test suite for the tasks
+    :param write_out: bool
+        If True, write out an example document and model input for checking task integrity
+    :param log_samples: bool
+        If True, write out all model outputs and documents for per-sample measurement and post-hoc analysis
+    :param gen_kwargs: str
+        String arguments for model generation
+        Ignored for all tasks with loglikelihood output_type
+    :param predict_only: bool
+        If true only model outputs will be generated and returned. Metrics will not be evaluated
+
+    :return
+        Dictionary of results
+    """
+    random.seed(0)
+    np.random.seed(1234)
+    torch.manual_seed(
+        1234
+    )  # TODO: this may affect training runs that are run with evaluation mid-run.
+
+    eval_logger.setLevel(getattr(logging, f"{verbosity}"))
+
+    if tasks is None:
+        tasks = []
+    assert (
+        tasks != []
+    ), "No tasks specified, or no tasks found. Please verify the task names."
+
+    if gen_kwargs is not None:
+        gen_kwargs = simple_parse_args_string(gen_kwargs)
+        eval_logger.warning(
+            "generation_kwargs specified through cli, these settings will update set parameters in yaml tasks. Ensure 'do_sample=True' for non-greedy decoding!"
+        )
+        if gen_kwargs == "":
+            gen_kwargs = None
+
+    if isinstance(model, str):
+        if model_args is None:
+            model_args = ""
+        lm = lm_eval.api.registry.get_model(model).create_from_arg_string(
+            model_args,
+            {
+                "batch_size": batch_size,
+                "max_batch_size": max_batch_size,
+                "device": device,
+            },
+        )
+    else:
+        assert isinstance(model, lm_eval.api.model.LM)
+        lm = model
+
+    if use_cache is not None:
+        print(f"Using cache at {use_cache + '_rank' + str(lm.rank) + '.db'}")
+        lm = lm_eval.api.model.CachingLM(
+            lm,
+            use_cache
+            # each rank receives a different cache db.
+            # necessary to avoid multiple writes to cache at once
+            + "_rank"
+            + str(lm.rank)
+            + ".db",
+        )
+
+    if task_manager is None:
+        task_manager = TaskManager(verbosity)
+
+    eval_logger.info(
+        "get_task_dict has been updated to accept an optional argument, `task_manager`"
+        "Read more here: https://github.com/EleutherAI/lm-evaluation-harness/blob/recursive-groups/docs/interface.md#external-library-usage"
+        )
+    task_dict = get_task_dict(tasks, task_manager)
+    for task_name in task_dict.keys():
+        task_obj = task_dict[task_name]
+        if isinstance(task_obj, tuple):
+            _, task_obj = task_obj
+            if task_obj is None:
+                continue
+
+        if task_obj.get_config("output_type") == "generate_until":
+            if gen_kwargs is not None:
+                task_obj.override_config(
+                    key="generation_kwargs", value=gen_kwargs, update=True
+                )
+
+            if predict_only:
+                log_samples = True
+                eval_logger.info(
+                    f"Processing {task_name} in output-only mode. Metrics will not be calculated!"
+                )
+                # we have to change the class properties post-hoc. This is pretty hacky.
+                task_obj.override_metric(metric_name="bypass")
+
+        if num_fewshot is not None:
+            if (default_num_fewshot := task_obj.get_config("num_fewshot")) == 0:
+                eval_logger.info(
+                    f"num_fewshot has been set to 0 for {task_name} in its config. Manual configuration will be ignored."
+                )
+            else:
+                eval_logger.warning(
+                    f"Overwriting default num_fewshot of {task_name} from {default_num_fewshot} to {num_fewshot}"
+                )
+                task_obj.override_config(key="num_fewshot", value=num_fewshot)
+
+    if check_integrity:
+        run_task_tests(task_list=tasks)
+    # get samples path from model_args
+    if model_args is not None:
+        model_args = simple_parse_args_string(model_args)
+        if "samples_path" in model_args:
+            samples_path = model_args["samples_path"]
+        else:
+            samples_path = None
+    else:
+        samples_path = None
+    import json
+    with open(samples_path,'r') as f:
+        samples = json.load(f)
+    results_tor = {}
+    for sample in samples:
+        lm._model.set_choices(sample)
+        results = evaluate(
+            lm=lm,
+            task_dict=task_dict,
+            limit=limit,
+            bootstrap_iters=bootstrap_iters,
+            decontamination_ngrams_path=decontamination_ngrams_path,
+            write_out=write_out,
+            log_samples=log_samples,
+            verbosity=verbosity,
+        )
+
+        if lm.rank == 0:
+            if isinstance(model, str):
+                model_name = model
+            elif hasattr(model, "config") and hasattr(model.config, "_name_or_path"):
+                model_name = model.config._name_or_path
+            else:
+                model_name = type(model).__name__
+
+            # add info about the model and few shot config
+            results["config"] = {
+                "model": model_name,
+                "model_args": model_args,
+                "batch_size": batch_size,
+                "batch_sizes": list(lm.batch_sizes.values())
+                if hasattr(lm, "batch_sizes")
+                else [],
+                "device": device,
+                "use_cache": use_cache,
+                "limit": limit,
+                "bootstrap_iters": bootstrap_iters,
+                "gen_kwargs": gen_kwargs,
+            }
+            results["git_hash"] = get_git_commit_hash()
+            results_tor[sample]=results
+    if lm.rank == 0:
+        return results_tor
+    else:
+        return None

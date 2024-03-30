@@ -1,5 +1,6 @@
 import copy
 import os
+from os.path import join
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, Union
 
@@ -1166,3 +1167,138 @@ class HFLM(LM):
         pbar.close()
 
         return res
+
+@register_model("hflm_ofa")
+class HFLM_OFA(HFLM):
+    def _create_model(
+        self,
+        pretrained: str,
+        revision: Optional[str] = "main",
+        dtype: Optional[Union[str, torch.dtype]] = "auto",
+        trust_remote_code: Optional[bool] = False,
+        # arguments used for splitting a model across GPUs naively.
+        # only used if `parallelize=True`.
+        # (accelerate naive PP (device_map) options)
+        parallelize: Optional[bool] = False,
+        device_map_option: Optional[str] = "auto",
+        max_memory_per_gpu: Optional[Union[int, str]] = None,
+        max_cpu_memory: Optional[Union[int, str]] = None,
+        offload_folder: Optional[str] = "./offload",
+        # PEFT and quantization options
+        peft: Optional[str] = None,
+        autogptq: Optional[Union[bool, str]] = False,
+        checkpoint_dir: Optional[str] = None,
+        sample: Optional[str] = '4',
+        **kwargs,
+    ) -> None:
+        """
+        Initializes an HF or HF-compatible PreTrainedModel from scratch
+        inside HFLM, using the kwargs passed into self.__init__().
+
+        Also handles functionality such as AutoGPTQ usage and PEFT wrapping.
+
+        For future similar extensions to AutoGPTQ that are not core to HF's ecosystem,
+        (such as PyTorch models that are nearly, but not quite, fully mirroring
+        HF's public interface relied on in this HFLM class)
+        please consider subclassing HFLM and overriding this and other methods as needed.
+        """
+
+        model_kwargs = kwargs if kwargs else {}
+
+        if parallelize:
+            model_kwargs.update(
+                _get_accelerate_args(
+                    device_map_option,  # TODO: phase out device_map_option?
+                    max_memory_per_gpu,
+                    max_cpu_memory,
+                    offload_folder,
+                )
+            )
+        elif "device_map" not in model_kwargs:
+            # set a device_map to initialize model on the right GPU.
+            # this is needed because it seems that the default behavior
+            # for quantized models now seems to be device_map="auto"
+            # which breaks data-parallel mode.
+            if hasattr(self, "accelerator"):
+                model_kwargs.update(
+                    {"device_map": {"": f"cuda:{self.accelerator.local_process_index}"}}
+                )
+            else:
+                model_kwargs.update({"device_map": {"": str(self.device)}})
+        try:
+            import sys
+            sys.path.append(os.environ.get('GPTQ_PATH'))
+            from auto_gptq.utils.peft_utils import get_gptq_peft_model, GPTQLoraConfig
+            from auto_gptq import AutoGPTQForCausalLM
+            from auto_gptq.nn_modules.qlinear import GeneralQuantLinear
+        except ModuleNotFoundError:
+            raise Exception(
+                "Tried to load auto_gptq, but auto-gptq is not installed ",
+                "please install auto-gptq via pip install lm-eval[gptq] or pip install -e .[gptq]",
+            )
+        quant_2bit_dir = "/data1/keyi/model/quant_nobias/quant_simple/quantized_model_2bit_triton_nobias"
+        quant_3bit_dir = "/data1/keyi/model/quant_nobias/quant_simple/quantized_model_3bit_triton_nobias"
+        quant_4bit_dir = "/data1/keyi/model/quant_nobias/quant_simple/quantized_model_4bit_triton_nobias" #TODO: args for bias
+
+        model = AutoGPTQForCausalLM.from_quantized(
+            "/data1/keyi/model/quant_nobias/quant_simple/quantized_model_234bit_triton_nobias",
+            device_map='auto',
+            inject_fused_attention = False,
+            inject_fused_mlp = False,
+            use_triton=True,
+            warmup_triton=False,
+            trainable=True
+        )
+        model.model.quantize_config = model.quantize_config
+        model_2bit = AutoGPTQForCausalLM.from_quantized(
+            quant_2bit_dir,
+            device_map= 'balanced',
+            inject_fused_attention = False,
+            inject_fused_mlp = False,
+            use_triton=True,
+            warmup_triton=False,
+            trainable=True
+        )
+        model.merge_other_bits(model_2bit.model)
+        del model_2bit
+        model_4bit = AutoGPTQForCausalLM.from_quantized(
+            quant_4bit_dir,
+            device_map= 'balanced',
+            inject_fused_attention = False,
+            inject_fused_mlp = False,
+            use_triton=True,
+            warmup_triton=False,
+            trainable=True
+        )
+        model.merge_other_bits(model_4bit.model)
+        del model_4bit
+        model_3bit = AutoGPTQForCausalLM.from_quantized(
+            quant_3bit_dir,
+            device_map= 'balanced',
+            inject_fused_attention = False,
+            inject_fused_mlp = False,
+            use_triton=True,
+            warmup_triton=False,
+            trainable=True
+        )
+        model.merge_other_bits(model_3bit.model)
+        del model_3bit
+        model.train()
+
+        config = GPTQLoraConfig(
+            r=64,
+            lora_alpha=16,
+            lora_dropout=0.,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+
+        print("Loading adapters from checkpoint.")
+        model = get_gptq_peft_model(model, config, auto_find_all_linears=True, train_mode=True)
+        model.load_adapter(join(checkpoint_dir, 'adapter_model'),adapter_name='default')
+        for name, p in model.named_parameters():
+            if 'lora_' in name:
+                print(name, p.sum())
+        self._model = model
+
+        return None
